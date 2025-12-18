@@ -1,10 +1,17 @@
 import React, { useState, useEffect } from "react";
+import CryptoJS from "crypto-js";
 
 const AccountCreator = ({ onRegister }) => {
   const [name, setName] = useState("");
   const [role, setRole] = useState("patient");
   const [walletAddress, setWalletAddress] = useState("");
   const [id, setId] = useState("");
+useEffect(() => {
+  if (walletAddress && id) {
+    const sessionKey = CryptoJS.SHA256(walletAddress + id).toString();
+    sessionStorage.setItem("sessionKey", sessionKey);
+  }
+}, [walletAddress, id]);
 
   // Fungsi generator ID rumah sakit
   const generateHospitalId = () => {
@@ -72,7 +79,7 @@ const AccountCreator = ({ onRegister }) => {
       </div>
 
       <div>
-        <label className="block font-medium text-gray-700 mb-1">Wallet Address</label>
+        <label className="block font-medium text-gray-700 mb-1">Ethereum Address</label>
         <input
           type="text"
           className="w-full px-3 py-2 border rounded-lg"

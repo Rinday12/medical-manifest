@@ -1,7 +1,6 @@
 import React, { useState, useEffect } from "react";
 import "./App.css";
 
-// Components
 import StageUploader from "./components/StageUploader";
 import ManifestFetcher from "./components/ManifestFetcher";
 import AccountCreator from "./components/AccountCreator";
@@ -9,181 +8,164 @@ import Section from "./components/Section";
 import Label from "./components/Label";
 import Input from "./components/Input";
 import SubmitButton from "./components/SubmitButton";
+import { QRCodeCanvas } from "qrcode.react";
 
-// Utilities
-import { createNewManifest, addEndDateToManifest } from "./utils/manifest";
-import { encryptText } from "./utils/encrypt";
+import {
+  setSessionKey,
+  getSessionKey,
+  encryptTextToBase64
+} from "./utils/encrypt";
 import { uploadToIPFS } from "./utils/ipfs";
 import { sendCIDToSmartContract } from "./utils/contract";
-import { QRCodeCanvas } from 'qrcode.react'; // di bagian atas
+import {
+  createNewManifest,
+  addEpisode,
+  addEndDateToManifest,
+  getPatientIdFromManifest,
+  countEpisodesInManifest,
+  episodeExistsInManifest
+} from "./utils/manifest";
 
+const stages = [
+  "admission",
+  "normal_ward",
+  "procedures",
+  "surgeries",
+  "icu",
+  "stabilization",
+  "discharge"
+];
 
 const App = () => {
-  // === States ===
   const [patientId, setPatientId] = useState("");
-  const [episodeId, setEpisodeId] = useState("E01");
+  const [walletAddress, setWalletAddress] = useState("");
   const [manifestXml, setManifestXml] = useState("");
   const [manifestReady, setManifestReady] = useState(false);
   const [accounts, setAccounts] = useState([]);
   const [cidResult, setCidResult] = useState("");
   const [copySuccess, setCopySuccess] = useState("");
   const [cid, setCid] = useState(null);
+  const [episodeId, setEpisodeId] = useState("");
 
-  const stages = [
-    "admission",
-    "normal_ward",
-    "procedures",
-    "surgeries",
-    "icu",
-    "stabilization",
-    "discharge",
-  ];
+  useEffect(() => {
+    if (!patientId.trim()) {
+      setManifestXml("");
+      setManifestReady(false);
+      setEpisodeId("");
+    }
+  }, [patientId]);
 
-  // === Handlers ===
+  useEffect(() => {
+    if (walletAddress && patientId) {
+      setSessionKey(walletAddress, patientId);
+    }
+  }, [walletAddress, patientId]);
+
   const handleRegisterAccount = (account) => {
     setAccounts((prev) => [...prev, account]);
     alert(`${account.role} ${account.name} registered successfully!`);
   };
 
   const handleGenerateManifest = () => {
-    const trimmedId = patientId.trim();
-    const trimmedEpisode = episodeId.trim();
+    const pid = patientId.trim();
+    if (!pid) return alert("Please enter Patient ID.");
 
-    if (!trimmedId || !trimmedEpisode) {
-      return alert("Please enter both Patient ID and Episode ID.");
+    const patient = accounts.find((a) => a.role === "patient" && a.id === pid);
+    if (!patient) return alert("⚠️ Patient not registered. Please register patient account first.");
+
+    let xml = manifestXml;
+    if (!xml || getPatientIdFromManifest(xml) !== pid) {
+      xml = createNewManifest(pid, patient.name);
     }
 
-    const patientAccount = accounts.find(
-      (acc) =>
-        acc.role.toLowerCase() === "patient" &&
-        acc.id.toLowerCase() === trimmedId.toLowerCase()
-    );
+    const episodeCount = countEpisodesInManifest(xml) + 1;
+    const newEpisodeId = `EPS-${episodeCount}`;
 
-    if (!patientAccount) {
-      return alert("⚠️ Patient not registered. Please register patient account first.");
+    if (!episodeExistsInManifest(xml, newEpisodeId)) {
+      xml = addEpisode(xml, pid, patient.name, new Date().toISOString());
     }
 
-    const manifest = createNewManifest(
-      patientAccount.id,
-      patientAccount.name,
-      trimmedEpisode,
-      new Date().toISOString(),
-      ""
-    );
-
-    setManifestXml(manifest);
+    setEpisodeId(newEpisodeId);
+    setManifestXml(xml);
     setManifestReady(true);
   };
 
- const handleSubmitManifest = async () => {
-  if (!manifestXml) return alert("Manifest is empty. Please generate it first.");
+  const handleSubmitManifest = async () => {
+    if (!manifestXml) return alert("Manifest is empty. Please generate it first.");
+    if (!walletAddress || !patientId) return alert("⚠️ Wallet address dan Patient ID wajib diisi.");
 
-  try {
-    const updatedManifest = addEndDateToManifest(manifestXml, new Date().toISOString());
-    const timestamp = new Date().toISOString();
-    const fileName = `manifest-${patientId}-${episodeId}-${timestamp}.xml`;
+    try {
+      const xmlWithEnd = addEndDateToManifest(manifestXml, episodeId, new Date().toISOString());
+      if (typeof xmlWithEnd !== "string") throw new Error("Manifest XML is invalid");
 
-    const encrypted = await encryptText(updatedManifest);
-    const cid = await uploadToIPFS(encrypted, fileName);
+      const sessionKey = getSessionKey();
+      if (!sessionKey) throw new Error("Session key not found. Please re-enter wallet and patient ID.");
 
-    // === Simpan ke State dan LocalStorage ===
-    setCid(cid);
-    localStorage.setItem(`manifestCID-${patientId}-${episodeId}`, cid);
+      const fileName = `manifest-${patientId}-${episodeId}-${new Date().toISOString()}.xml`;
+      const encryptedBase64 = encryptTextToBase64(xmlWithEnd, sessionKey);
+      const encryptedBlob = new Blob([encryptedBase64], { type: "text/plain" });
 
-    // === Simpan ke Smart Contract ===
-    await sendCIDToSmartContract(cid);
+      const newCid = await uploadToIPFS(encryptedBlob, fileName);
+      await sendCIDToSmartContract(newCid);
+      await sendCIDToEMR(patientId, episodeId, newCid);
 
-    // === Kirim ke EMR ===
-    await sendCIDToEMR(patientId, episodeId, cid);
+      localStorage.setItem(`manifestCID-${patientId}-${episodeId}`, newCid);
+      setCidResult(newCid);
+      setCid(newCid);
+      alert("✅ Manifest submitted successfully!");
+    } catch (err) {
+      console.error("❌ Gagal submit manifest:", err);
+      alert(`❌ Failed to submit manifest: ${err.message}`);
+    }
+  };
 
-    setCidResult(cid);
-    alert("✅ Manifest submitted successfully!");
-  } catch (error) {
-    console.error("Error submitting manifest:", error);
-    alert(`❌ Failed to submit manifest.\n${error.message}`);
-  }
-};
-
-const sendCIDToEMR = async (patientId, episodeId, cid) => {
-  try {
-    await fetch("http://127.0.0.1:5000/store-cid", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ patientId, episodeId, cid }),
-    });
-    console.log("✅ CID sent to EMR successfully");
-  } catch (err) {
-    console.error("❌ Failed to send CID to EMR:", err);
-  }
-};
-
-
+  const sendCIDToEMR = async (pid, eid, c) => {
+    try {
+      await fetch("http://127.0.0.1:5000/store-cid", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ patientId: pid, episodeId: eid, cid: c })
+      });
+    } catch (e) {
+      console.error("❌ Failed to send CID to EMR:", e);
+    }
+  };
 
   const handleCopy = (text) => {
     navigator.clipboard.writeText(text)
       .then(() => setCopySuccess("📋 Copied!"))
       .catch(() => setCopySuccess("❌ Failed to copy"));
-
     setTimeout(() => setCopySuccess(""), 2000);
   };
 
-  useEffect(() => {
-    if (!patientId.trim()) {
-      setManifestXml("");
-      setManifestReady(false);
-    }
-  }, [patientId]);
-
-
-
-
-  // === Render ===
   return (
-    <div className="app-container max-w-4xl mx-auto px-4 py-6 space-y-6">
-      <button className="refresh-button" onClick={() => window.location.reload()}>
+    <div className="app-container">
+      <button className="btn-refresh" onClick={() => window.location.reload()}>
         Refresh Page
       </button>
 
-      {/* 1. Register Account */}
       <Section title="Register Doctor or Patient Account" color="text-green-700">
         <AccountCreator onRegister={handleRegisterAccount} />
       </Section>
 
-      {/* 2. List Registered Accounts */}
       {accounts.length > 0 && (
         <Section title="Registered Accounts">
-          <ul className="list-disc pl-6 space-y-1 text-sm text-gray-700">
-            {accounts.map((acc, i) => (
-              <li key={i}>
-                <strong className="uppercase text-green-600">{acc.role}</strong>: {acc.name} — ID: {acc.id}
-              </li>
+          <ul>
+            {accounts.map((a, i) => (
+              <li key={i}>{a.role}: {a.name} — ID: {a.id}</li>
             ))}
           </ul>
         </Section>
       )}
 
-      {/* 3. Manifest Generator */}
       <Section title="Patient Data Uploader" color="text-blue-700">
-        <Label htmlFor="patientId">Patient ID from Hospital:</Label>
-        <Input
-          id="patientId"
-          value={patientId}
-          onChange={(e) => setPatientId(e.target.value)}
-          placeholder="e.g., RS20240678"
-        />
-        <Label htmlFor="episodeId">Episode ID:</Label>
-        <Input
-          id="episodeId"
-          value={episodeId}
-          onChange={(e) => setEpisodeId(e.target.value)}
-          placeholder="e.g., E01, E02, etc."
-        />
+        <Label>Patient ID:</Label>
+        <Input value={patientId} onChange={(e) => setPatientId(e.target.value)} />
+        <Label>Wallet Address:</Label>
+        <Input value={walletAddress} onChange={(e) => setWalletAddress(e.target.value)} />
         <SubmitButton onClick={handleGenerateManifest}>Generate Manifest</SubmitButton>
       </Section>
 
-      {/* 4. Upload Data & Submit Manifest */}
       {manifestReady && (
         <Section title="Upload Files by Stage" color="text-indigo-700">
           {stages.map((stage) => (
@@ -192,60 +174,41 @@ const sendCIDToEMR = async (patientId, episodeId, cid) => {
               stage={stage}
               manifestXml={manifestXml}
               setManifestXml={setManifestXml}
+              patientId={patientId}
+              episodeId={episodeId}
+              walletAddress={walletAddress}
             />
           ))}
 
-          {/* Preview and Copy Manifest */}
-          <div className="mt-4">
-            <Label>Preview Manifest XML:</Label>
-            <pre className="manifest-preview bg-gray-100 p-4 rounded overflow-x-auto text-sm">
-              {manifestXml}
-            </pre>
-            <button
-              className="mt-2 bg-amber-500 hover:bg-amber-600 text-white py-1 px-3 rounded text-sm"
-              onClick={() => handleCopy(manifestXml)}
-            >
-              📋 Copy Manifest
-            </button>
-            {copySuccess && <span className="ml-3 text-green-600 text-sm">{copySuccess}</span>}
+          <div>
+            <Label>Preview Manifest:</Label>
+            <pre className="manifest-preview">{manifestXml}</pre>
+            <button onClick={() => handleCopy(manifestXml)}>Copy Manifest</button>
+            {copySuccess && <span>{copySuccess}</span>}
           </div>
 
-          {/* Submit to Blockchain */}
-          <SubmitButton onClick={handleSubmitManifest}>
-            Submit Manifest to Blockchain
-          </SubmitButton>
+          <SubmitButton onClick={handleSubmitManifest}>Submit Manifest to Blockchain</SubmitButton>
 
-          {/* Display CID Result with Copy */}
           {cidResult && (
-            <div className="mt-4">
-              <Label>CID stored on blockchain:</Label>
-              <div className="bg-purple-50 p-3 rounded flex items-center text-sm shadow-sm">
-                <code className="flex-1 truncate">{cidResult}</code>
-                <button
-                  className="ml-3 bg-purple-600 hover:bg-purple-700 text-white px-2 py-1 rounded text-xs"
-                  onClick={() => handleCopy(cidResult)}
-                >
-                  📋 Copy CID
-                </button>
-              </div>
+            <div>
+              <Label>CID:</Label>
+              <code>{cidResult}</code>
+              <button onClick={() => handleCopy(cidResult)}>Copy CID</button>
             </div>
           )}
-          {/* Tampilkan QR Code */}
-{cid && (
-  <div className="mt-4">
-    <Label>QR Code of CID:</Label>
-    <QRCodeCanvas value={cid} size={150} />
-    <p className="text-sm mt-2 text-gray-600">{cid}</p>
-  </div>
-)}
+
+          {cid && (
+            <div>
+              <Label>QR Code:</Label>
+              <QRCodeCanvas value={cid} size={120} />
+            </div>
+          )}
         </Section>
       )}
 
-      {/* 5. Fetch CID */}
       <ManifestFetcher />
     </div>
   );
- 
 };
 
 export default App;
