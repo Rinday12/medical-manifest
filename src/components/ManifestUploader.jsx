@@ -1,7 +1,7 @@
 // src/components/ManifestUploader.jsx
 
 import React, { useEffect, useState } from "react";
-import { encryptText, getSessionKey, setSessionKey } from "../utils/encrypt";
+import { deriveKey, encryptFile } from "../utils/encryption";
 import { uploadToIPFS } from "../utils/ipfs";
 
 const ManifestUploader = ({ manifestContent, walletAddress, patientId }) => {
@@ -10,9 +10,8 @@ const ManifestUploader = ({ manifestContent, walletAddress, patientId }) => {
   const [uploading, setUploading] = useState(false);
 
   useEffect(() => {
-    if (walletAddress && patientId) {
-      console.log("🔐 Setting session key using wallet & patientId...");
-      setSessionKey(walletAddress, patientId);
+    if (!walletAddress || !patientId) {
+      console.warn("⚠️ walletAddress atau patientId belum tersedia");
     }
   }, [walletAddress, patientId]);
 
@@ -20,43 +19,47 @@ const ManifestUploader = ({ manifestContent, walletAddress, patientId }) => {
     try {
       setUploading(true);
       setError(null);
-      console.log("📦 Starting manifest upload...");
+      setCid(null);
 
-      // 1. Get session key
-      const sessionKey = getSessionKey();
-      if (!sessionKey) {
-        throw new Error("Session key not found. Please login or re-authenticate.");
-      }
-      console.log("🔑 Session key found:", sessionKey.toString());
-
-      // 2. Debug manifest content
-      if (!manifestContent) {
-        throw new Error("Manifest content is empty or undefined.");
-      }
-      console.log("📄 Manifest content:", manifestContent);
-
-      // 3. Encrypt
-      console.log("🔐 Encrypting manifest...");
-      const encryptedText = encryptText(manifestContent, sessionKey);
-
-      if (!encryptedText || typeof encryptedText !== "string") {
-        throw new Error("Encryption failed. Encrypted result is invalid.");
-      }
-      console.log("🔐 Encrypted text length:", encryptedText.length);
-
-      // 4. Upload to IPFS
-      console.log("⬆️ Uploading to IPFS...");
-      const ipfsCid = await uploadToIPFS(encryptedText);
-
-      if (!ipfsCid || typeof ipfsCid !== "string") {
-        throw new Error("IPFS upload failed. No CID returned.");
+      if (!walletAddress || !patientId) {
+        throw new Error("Wallet address dan Patient ID wajib diisi");
       }
 
-      console.log("✅ Upload complete. CID:", ipfsCid);
-      setCid(ipfsCid);
+      if (!manifestContent || typeof manifestContent !== "string") {
+        throw new Error("Manifest content kosong atau tidak valid");
+      }
+
+      console.log("🔐 Deriving AES key...");
+      const key = await deriveKey(walletAddress, patientId);
+
+      console.log("📄 Converting manifest to Blob...");
+      const manifestBlob = new Blob(
+        [new TextEncoder().encode(manifestContent)],
+        { type: "application/xml" }
+      );
+
+      console.log("🔒 Encrypting manifest...");
+      const { iv, data } = await encryptFile(manifestBlob, key);
+
+      // Gabungkan IV + ciphertext (FORMAT WAJIB)
+      const encryptedBlob = new Blob(
+        [iv, data],
+        { type: "application/octet-stream" }
+      );
+
+      console.log("⬆️ Uploading encrypted manifest to IPFS...");
+      const cid = await uploadToIPFS(
+        encryptedBlob,
+        `manifest-${patientId}-${Date.now()}.bin`
+      );
+
+      if (!cid) throw new Error("Upload ke IPFS gagal");
+
+      console.log("✅ Manifest uploaded. CID:", cid);
+      setCid(cid);
     } catch (err) {
-      console.error("❌ Upload error:", err.message);
-      setError(err.message);
+      console.error("❌ Upload error:", err);
+      setError(err.message || "Upload gagal");
     } finally {
       setUploading(false);
     }
@@ -67,7 +70,7 @@ const ManifestUploader = ({ manifestContent, walletAddress, patientId }) => {
       <h2 className="text-lg font-semibold mb-2">📤 Upload Manifest</h2>
 
       <button
-        className="bg-blue-600 text-white px-4 py-2 rounded hover:bg-blue-700"
+        className="bg-blue-600 text-white px-4 py-2 rounded disabled:opacity-50"
         onClick={handleUpload}
         disabled={uploading}
       >
